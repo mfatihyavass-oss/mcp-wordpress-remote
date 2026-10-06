@@ -98,7 +98,8 @@ async function WordPressProxy() {
 
       // Return the WordPress server's initialize response
       const wordpressInitResponse = {
-        protocolVersion: initResult.protocolVersion || '2025-06-18',
+        protocolVersion:
+          initResult.protocolVersion || request.params?.protocolVersion || '2025-06-18',
         serverInfo: initResult.serverInfo,
         capabilities: initResult.capabilities,
         instructions: initResult.instructions || 'MCP WordPress Remote Proxy Server',

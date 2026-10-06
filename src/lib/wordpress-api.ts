@@ -4,6 +4,7 @@
 import * as path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { createParser } from 'eventsource-parser';
+import { LATEST_PROTOCOL_VERSION } from '@modelcontextprotocol/sdk/types.js';
 import { WordPressRequestParams, WordPressResponse } from './types.js';
 import { logger, LogLevel } from './utils.js';
 import { CONFIG, validateConfig, getDefaultOAuthScopes, getCustomHeaders } from './config.js';
@@ -38,6 +39,13 @@ let globalEvents: EventEmitter | null = null;
 
 // Global session ID received from WordPress server
 let globalSessionId: string | null = null;
+
+// MCP protocol version negotiated with the WordPress server for this session.
+// Servers implementing MCP 2025-11-25+ bind every follow-up HTTP request to the
+// version negotiated during `initialize` and reject a session whose
+// `MCP-Protocol-Version` header disagrees (HTTP 400 / JSON-RPC -32600). The value
+// is therefore captured from the initialize response instead of hard-coded.
+let sessionProtocolVersion: string | null = null;
 let lastInitializeRequest: { requestData: any; useJsonRpc: boolean } | null = null;
 let sessionRefreshPromise: Promise<void> | null = null;
 
@@ -272,6 +280,67 @@ function isInvalidSessionError(error: APIError): boolean {
   );
 }
 
+function normalizeProtocolVersion(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : null;
+}
+
+function getRequestedProtocolVersion(requestData: any): string | null {
+  // JSON-RPC requests carry the version under `params`; the simple transport
+  // spreads the client's initialize params at the top level.
+  return (
+    normalizeProtocolVersion(requestData?.params?.protocolVersion) ??
+    normalizeProtocolVersion(requestData?.protocolVersion)
+  );
+}
+
+/**
+ * The `MCP-Protocol-Version` header must repeat the version negotiated for the
+ * current session. During `initialize` nothing is negotiated yet, so the version
+ * the client asked for is echoed; afterwards the negotiated version wins.
+ */
+function getProtocolVersionHeader(requestData: any): string {
+  if (isInitializeRequest(requestData)) {
+    return getRequestedProtocolVersion(requestData) ?? LATEST_PROTOCOL_VERSION;
+  }
+
+  // Prefer the version the server actually negotiated for this session. If it
+  // never reported one, fall back to the version the client asked for during
+  // `initialize` (remembered in `lastInitializeRequest`) before the SDK latest,
+  // so a server that negotiates an older version but omits it from the response
+  // still receives a header that matches its session.
+  return (
+    sessionProtocolVersion ??
+    getRequestedProtocolVersion(requestData) ??
+    getRememberedClientProtocolVersion() ??
+    LATEST_PROTOCOL_VERSION
+  );
+}
+
+/** The protocol version the client requested on its last `initialize`, if any. */
+function getRememberedClientProtocolVersion(): string | null {
+  return lastInitializeRequest
+    ? getRequestedProtocolVersion(lastInitializeRequest.requestData)
+    : null;
+}
+
+/** Stores the version WordPress negotiated, so later requests can repeat it. */
+function captureProtocolVersion(responseData: unknown): void {
+  const envelope = responseData as {
+    protocolVersion?: unknown;
+    result?: { protocolVersion?: unknown };
+  } | null;
+  const version = normalizeProtocolVersion(
+    envelope?.protocolVersion ?? envelope?.result?.protocolVersion
+  );
+
+  if (!version || version === sessionProtocolVersion) {
+    return;
+  }
+
+  sessionProtocolVersion = version;
+  logger.info(`MCP protocol version negotiated with WordPress: ${version}`, 'PROTOCOL');
+}
+
 function updateSessionId(sessionId: string): void {
   if (globalSessionId === sessionId) {
     return;
@@ -391,7 +460,7 @@ async function executeWordPressRequest(
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     Accept: 'application/json, text/event-stream',
-    'MCP-Protocol-Version': '2025-06-18', // MCP protocol version
+    'MCP-Protocol-Version': getProtocolVersionHeader(requestData), // must match the session's negotiated version
     ...customHeaders, // Merge custom headers
   };
 
@@ -469,6 +538,12 @@ async function executeWordPressRequest(
     const sessionIdHeader = response.headers.get('Mcp-Session-Id');
     if (sessionIdHeader) {
       updateSessionId(sessionIdHeader);
+    }
+
+    // Remember the protocol version this session negotiated so that every later
+    // request repeats it in the `MCP-Protocol-Version` header.
+    if (isInitializeRequest(requestData)) {
+      captureProtocolVersion(responseData);
     }
 
     logger.api('Response received successfully');
@@ -592,6 +667,10 @@ export async function wpRequest(
 
   if (isInitializeRequest(requestData)) {
     cacheInitializeRequest(requestData, useJsonRpc);
+    // A fresh handshake decides the protocol version again: drop the previous
+    // session's value so a server that omits the version can't leave us
+    // repeating a stale one.
+    sessionProtocolVersion = null;
   }
 
   const sessionIdUsed = globalSessionId;
